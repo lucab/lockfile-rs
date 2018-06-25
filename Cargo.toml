@@ -18,5 +18,8 @@ maintenance = { status = "experimental" }
 [dependencies]
 log = "0.4"
 
+[target.'cfg(unix)'.dependencies]
+openat = "0.1.15"
+
 [dev-dependencies]
 tempfile = "3"

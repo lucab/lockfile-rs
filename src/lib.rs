@@ -24,12 +24,17 @@
 //! ```
 #[macro_use]
 extern crate log;
+#[cfg(unix)]
+extern crate openat;
 
 use std::fs::{self, File, OpenOptions};
 use std::io;
 use std::mem::{self, ManuallyDrop};
-use std::path::{Path, PathBuf};
 use std::ops::Deref;
+use std::path::{Path, PathBuf};
+
+#[cfg(unix)]
+use std::os::unix::io::{FromRawFd, IntoRawFd, RawFd};
 
 /// A lockfile that cleans up after itself.
 ///
@@ -40,6 +45,8 @@ use std::ops::Deref;
 pub struct Lockfile {
     handle: ManuallyDrop<File>,
     path: PathBuf,
+    #[cfg(unix)]
+    dirfd: Option<openat::Dir>,
 }
 
 impl Lockfile {
@@ -73,6 +80,7 @@ impl Lockfile {
         debug!(r#"lockfile created at "{}""#, path.display());
 
         Ok(Lockfile {
+            dirfd: None,
             handle: ManuallyDrop::new(lockfile),
             path: path.to_owned(),
         })
@@ -110,6 +118,7 @@ impl Lockfile {
     }
 }
 
+#[cfg(not(unix))]
 impl Drop for Lockfile {
     fn drop(&mut self) {
         // Safe because we don't use handle after dropping it.
@@ -127,6 +136,57 @@ impl Drop for Lockfile {
             // path destructor will be run as usual.
             debug!(r#"Removed lockfile at "{}""#, self.path.display());
         }
+    }
+}
+
+#[cfg(unix)]
+impl Drop for Lockfile {
+    fn drop(&mut self) {
+        // Safe because we don't use handle after dropping it.
+        unsafe {
+            // close file (this must happen before removal on windows)
+            ManuallyDrop::drop(&mut self.handle);
+            if let Some(ref dir) = self.dirfd {
+                if let Ok(_) = dir.remove_file(&self.path) {
+                    debug!(r#"Removed lockfile "{}" from dirfd"#, self.path.display());
+                    return;
+                }
+            };
+            // remove file
+            if let Err(e) = fs::remove_file(&self.path) {
+                warn!(
+                    r#"could not remove lockfile at "{}": {}"#,
+                    self.path.display(),
+                    e
+                );
+            }
+            // path destructor will be run as usual.
+            debug!(r#"Removed lockfile at "{}""#, self.path.display());
+        }
+    }
+}
+
+#[cfg(unix)]
+pub trait LockfileUnixExt {
+    fn create_at(dirfd: RawFd, path: impl AsRef<Path>) -> Result<Lockfile, io::Error>;
+}
+
+#[cfg(unix)]
+impl LockfileUnixExt for Lockfile {
+    fn create_at(dirfd: RawFd, path: impl AsRef<Path>) -> Result<Lockfile, io::Error> {
+        let dir = unsafe { openat::Dir::from_raw_fd(dirfd) };
+        let file = match dir.new_file(path.as_ref(), 493){
+            Ok(f) => f,
+            Err(e) => {
+                dir.into_raw_fd();
+                return Err(e);
+            }
+        };
+        Ok(Lockfile {
+            dirfd: Some(dir),
+            handle: ManuallyDrop::new(file),
+            path: path.as_ref().to_owned(),
+        })
     }
 }
 
@@ -186,9 +246,9 @@ mod tests {
     use self::tempfile::NamedTempFile;
     use super::Lockfile;
 
-    use std::path::PathBuf;
     use std::fs;
     use std::io;
+    use std::path::PathBuf;
 
     /// create and delete a temp file to get a tmp location.
     fn tmp_path() -> PathBuf {
@@ -201,7 +261,10 @@ mod tests {
         let lockfile = Lockfile::create(&path).unwrap();
         assert_eq!(lockfile.path(), path);
         lockfile.release().unwrap();
-        assert_eq!(fs::metadata(path).unwrap_err().kind(), io::ErrorKind::NotFound);
+        assert_eq!(
+            fs::metadata(path).unwrap_err().kind(),
+            io::ErrorKind::NotFound
+        );
     }
 
     #[test]
@@ -209,6 +272,9 @@ mod tests {
         // check trying to lock twice is an error
         let path = tmp_path();
         let _lockfile = Lockfile::create(&path).unwrap();
-        assert_eq!(Lockfile::create(&path).unwrap_err().kind(), io::ErrorKind::AlreadyExists);
+        assert_eq!(
+            Lockfile::create(&path).unwrap_err().kind(),
+            io::ErrorKind::AlreadyExists
+        );
     }
 }
